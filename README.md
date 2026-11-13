@@ -1,0 +1,43 @@
+# 3x-ui Hysteria2 Port Hopping Tool (`hy2`)
+
+Zero-dependency single-file Linux tool (Bash + Python 3 standard library) to audit **3x-ui / Xray Hysteria2** port hopping, configure idempotent IPv4/IPv6 NAT forwarding (`systemd`), and perform live bidirectional verification across PC and mobile clients.
+
+## Features
+
+1. **Full Audit (`--check` / `--json`)**
+   - Dynamically locates `x-ui` (`XUI_DB_FOLDER`, `XUI_BIN_FOLDER`, `xray` args), reads `x-ui.db` safely in WAL read-only mode, and cross-checks against `config.json` and live `ss -4/-6 -ulpne` UDP sockets.
+   - Detects IPv6 dual-stack blackholes (`listen: 0.0.0.0` while global IPv6 / `AAAA` is active), `v6only` mismatches, overlapping UDP services, and `INPUT` firewall blocks.
+   - Generates client-ready snippets tailored to `Xray >= 26.9.9` (`finalmask.udp` with `udphop` at the socket end and `mode: "intervalLocal,intervalRemote"`) and `sing-box` (`server_ports` colon syntax + `"15s"`), plus diagnostics for `v2rayN` and `v2rayNG` (Issue #6224 / `>= 2.4.0`).
+
+2. **Idempotent Dual-Stack NAT Persistence (`--apply` / `--dry-run` / `--uninstall`)**
+   - Creates an isolated `HY2_PORT_HOP` chain hooked at the top of `nat PREROUTING` without touching `filter` or `fail2ban` rules.
+   - Applies `-m addrtype --dst-type LOCAL` to avoid hijacking ephemeral outbound ports, switches to `DNAT` automatically when bound to non-primary secondary IPs, and persists via `/usr/local/sbin/hy2-port-hop-ctl`, `/etc/hy2-port-hop.conf`, and `hy2-port-hop.service`.
+
+3. **Live Bidirectional Verification & Secure Web Dashboard (`--monitor` / `--web`)**
+   - Uses kernel `AF_PACKET (SOCK_DGRAM)` + classic BPF (`SO_ATTACH_FILTER`) to drop high-throughput TCP traffic in kernel space while capturing UDP, IPv6 extension headers/fragments, and ICMP/ICMPv6 Port Unreachable replies.
+   - Aggregates per `(client_ip, family)` and matches outbound `sport == hopped_port` (conntrack reverse-SNAT) to confirm true bidirectional hopping (`BIDIR_OK`) and client source-port rotation.
+   - Optional temporary web dashboard bound to `127.0.0.1:18080` by default (`ssh -L` tunnel, or `--public-web` with explicit warning) protected by one-time OTP + `Bearer` session token.
+
+## Quick Install & Usage
+
+```bash
+# Install globally as `hy2`
+sudo curl -fsSL https://raw.githubusercontent.com/DongHua3/3x-ui-hy2-hop/main/hy2_hop_tool.sh -o /usr/local/sbin/hy2 && sudo chmod +x /usr/local/sbin/hy2
+
+# Interactive menu
+sudo hy2
+
+# Read-only audit
+sudo hy2 --check
+
+# Preview / apply dual-stack NAT rules
+sudo hy2 --apply --dry-run
+sudo hy2 --apply
+
+# Live bidirectional monitor (with optional local Web dashboard)
+sudo hy2 --monitor
+sudo hy2 --monitor --web
+
+# Uninstall rules and systemd service
+sudo hy2 --uninstall
+```
