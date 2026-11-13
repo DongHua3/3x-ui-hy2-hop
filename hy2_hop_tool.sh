@@ -1345,6 +1345,7 @@ class HopMonitor:
         self.stop_event = threading.Event()
         self.clients = {}  # (client_ip, fam) -> stats
         self.events = deque(maxlen=60)
+        self.local_ephemeral_flows = {}  # (remote_ip, remote_port, local_port) -> ts (ignore VPS own outbound DNS/NTP replies)
         self.nat_counters = {"v4_pkts": 0, "v4_bytes": 0, "v6_pkts": 0, "v6_bytes": 0}
         self.kernel_drops = 0
         self.kernel_packets = 0
@@ -1372,18 +1373,18 @@ class HopMonitor:
 
     def _evaluate_status(self, c):
         if c["icmp_unreach_hits"] > 0 and c["hop_out_pkts"] == 0 and c["main_out_pkts"] == 0:
-            return "ICMP_UNREACHABLE (疑似服务未监听该协议族或端口不可达)"
+            return "异常：端口不可达 (服务未监听对应 IPv4/IPv6 或防火墙拦截)"
         if len(c["hop_ports_bidir"]) >= 2:
-            if len(c["client_sports_seen"]) <= 1 and len(c["hop_ports_bidir"]) >= 2:
-                return "BIDIR_OK_WARN (已双向跳跃，但客户端源端口未同步变化，注意 conntrack 碰撞风险)"
-            return "BIDIR_OK (端口跳跃双向真实生效)"
+            if len(c["client_sports_seen"]) <= 1:
+                return "已生效(警告)：端口已双向跳转，但客户端源端口未变，注意 conntrack 碰撞"
+            return "已生效：端口跳跃双向正常轮换"
         if len(c["hop_ports_bidir"]) == 1:
-            return "HOP_SINGLE_PORT (已通过跳跃端口双向通信，等待下一周期观察是否轮换)"
+            return "跳跃中：已通过跳跃端口双向通信，等待下一轮跳变"
         if c["hop_in_pkts"] > 0 and c["hop_out_pkts"] == 0:
-            return "INBOUND_ONLY (仅收到入站包无回包：可能是公网扫描/密码错误/后端未响应)"
+            return "有去无回：收到跳跃端口包但服务端无回包 (查安全组/密钥/转发)"
         if c["main_in_pkts"] > 0 or c["main_out_pkts"] > 0:
-            return f"STUCK_MAIN_PORT (流量全部停留在主端口 {self.main_port}，未触发端口跳跃)"
-        return "IDLE"
+            return f"未生效：全部流量直接连主端口 {self.main_port}，客户端未跳"
+        return "等待流量"
 
     def _poll_nat_loop(self):
         while not self.stop_event.is_set():
@@ -1476,11 +1477,22 @@ class HopMonitor:
                 sport, dport = pkt["sport"], pkt["dport"]
                 is_out = (pkttype == PACKET_OUTGOING)
 
+                # Ignore link-local / VPC metadata / local DNS & NTP noise
+                peer_ip = pkt["dst"] if is_out else pkt["src"]
+                if peer_ip.startswith("169.254.") or peer_ip.startswith("fe80:") or peer_ip == "127.0.0.1":
+                    continue
+
                 if not is_out:
-                    # Inbound: client(src:sport) -> vps(dst:dport)
+                    # Inbound: remote(src:sport) -> vps(dst:dport)
                     in_hop = port_in_ranges(dport, self.hop_ranges)
                     in_main = (dport == self.main_port)
                     if not (in_hop or in_main):
+                        continue
+                    # Ignore replies to VPS's own outbound DNS/NTP/UDP probes whose ephemeral source port happens to fall in hop_ranges
+                    if in_hop and (
+                        (pkt["src"], sport, dport) in self.local_ephemeral_flows
+                        or sport in (53, 123, 5353)
+                    ):
                         continue
                     with self.lock:
                         c = self._get_client(pkt["src"], pkt["fam"])
@@ -1506,9 +1518,13 @@ class HopMonitor:
                                 if len(c["client_sports_seen"]) > 20:
                                     c["client_sports_seen"].pop(0)
                 else:
-                    # Outbound: vps(src:sport) -> client(dst:dport)
+                    # Outbound: vps(src:sport) -> remote(dst:dport)
                     out_hop = port_in_ranges(sport, self.hop_ranges)
                     out_main = (sport == self.main_port)
+                    if out_hop and (pkt["dst"], pkt["fam"]) not in self.clients:
+                        # Likely VPS initiating an outbound UDP request using an ephemeral port inside hop_ranges
+                        self.local_ephemeral_flows[(pkt["dst"], dport, sport)] = now
+                        continue
                     if not (out_hop or out_main):
                         continue
                     with self.lock:
@@ -1659,8 +1675,8 @@ async function doAuth() {
   setInterval(poll, 1200);
 }
 function statusCls(s) {
-  if (s.startsWith("BIDIR_OK (")) return "ok";
-  if (s.startsWith("BIDIR_OK_WARN") || s.startsWith("HOP_SINGLE")) return "warn";
+  if (s.startsWith("已生效：")) return "ok";
+  if (s.startsWith("已生效(警告)") || s.startsWith("跳跃中：")) return "warn";
   return "err";
 }
 async function poll() {
@@ -1834,10 +1850,12 @@ def run_monitor_loop(report, main_port, hop_ports_str, enable_web=False, public_
             if not snap["clients"]:
                 print("  等待客户端数据包... 请在 PC / 手机连上该节点并访问海外网站（连续使用 20s 观察端口轮换）")
             else:
-                print(f"  {'来源 IP':<32} {'族':<5} {'主端口(入/出)':<14} {'跳跃(入/出)':<14} {'源端口数':<8} {'已确认跳转端口'}")
+                print(f"  {'来源 IP':<26} {'族':<5} {'主端口(入/出)':<15} {'跳跃(入/出)':<15} {'源端口数':<8} {'已确认跳转端口'}")
                 for c in snap["clients"][:10]:
+                    main_col = f"{c['main_in_pkts']}/{c['main_out_pkts']}"
+                    hop_col = f"{c['hop_in_pkts']}/{c['hop_out_pkts']}"
                     ports_str = ",".join(str(p) for p in c["hop_ports_bidir"][-5:]) or "-"
-                    print(f"  {c['ip']:<32} {c['family']:<5} {c['main_in_pkts']}/{c['main_out_pkts']:<11} {c['hop_in_pkts']}/{c['hop_out_pkts']:<11} {c['client_sports_count']:<8} {ports_str}")
+                    print(f"  {c['ip']:<26} {c['family']:<5} {main_col:<15} {hop_col:<15} {c['client_sports_count']:<8} {ports_str}")
                     print(f"     -> 判定: {c['status']}")
 
             print("\n--- 最近事件 ---")
