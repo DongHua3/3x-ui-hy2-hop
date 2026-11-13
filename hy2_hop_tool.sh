@@ -71,6 +71,7 @@ extract_payload() {
 #!/usr/bin/env python3
 import argparse
 import ctypes
+import fcntl
 import http.server
 import ipaddress
 import json
@@ -1104,28 +1105,50 @@ def apply_nat_plan(plan, dry_run=False):
         print("[ERROR] 写入防火墙规则与 systemd 服务需要 root 权限！", file=sys.stderr)
         return False
 
-    with open(CONF_FILE, "w", encoding="utf-8") as f:
-        json.dump(plan, f, indent=2)
-    os.chmod(CONF_FILE, 0o600)
-
-    with open(CTL_BIN, "w", encoding="utf-8") as f:
-        f.write(CTL_SCRIPT_CONTENT)
-    os.chmod(CTL_BIN, 0o700)
-
-    with open(SERVICE_FILE, "w", encoding="utf-8") as f:
-        f.write(SERVICE_CONTENT)
-    os.chmod(SERVICE_FILE, 0o644)
-
-    run_cmd(["systemctl", "daemon-reload"])
-    rc, out, err = run_cmd(["systemctl", "enable", "--now", SERVICE_NAME])
-    if rc != 0:
-        print(f"[ERROR] 启动 {SERVICE_NAME} 失败: {err or out}", file=sys.stderr)
+    lock_fd = None
+    try:
+        lock_fd = open("/run/hy2-port-hop-apply.lock", "w", encoding="utf-8")
+        fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock_fd.write(str(os.getpid()))
+        lock_fd.flush()
+    except BlockingIOError:
+        print("[ERROR] 另一个 hy2 实例正在修改防火墙规则，请稍后重试。", file=sys.stderr)
+        if lock_fd:
+            lock_fd.close()
         return False
-    # Force restart so updated conf takes effect immediately if already active
-    rc2, out2, err2 = run_cmd(["systemctl", "restart", SERVICE_NAME])
-    if rc2 != 0:
-        print(f"[ERROR] 重启 {SERVICE_NAME} 失败: {err2 or out2}", file=sys.stderr)
-        return False
+    except Exception:
+        pass
+
+    try:
+        with open(CONF_FILE, "w", encoding="utf-8") as f:
+            json.dump(plan, f, indent=2)
+        os.chmod(CONF_FILE, 0o600)
+
+        with open(CTL_BIN, "w", encoding="utf-8") as f:
+            f.write(CTL_SCRIPT_CONTENT)
+        os.chmod(CTL_BIN, 0o700)
+
+        with open(SERVICE_FILE, "w", encoding="utf-8") as f:
+            f.write(SERVICE_CONTENT)
+        os.chmod(SERVICE_FILE, 0o644)
+
+        run_cmd(["systemctl", "daemon-reload"])
+        rc, out, err = run_cmd(["systemctl", "enable", "--now", SERVICE_NAME])
+        if rc != 0:
+            print(f"[ERROR] 启动 {SERVICE_NAME} 失败: {err or out}", file=sys.stderr)
+            return False
+        # Force restart so updated conf takes effect immediately if already active
+        rc2, out2, err2 = run_cmd(["systemctl", "restart", SERVICE_NAME])
+        if rc2 != 0:
+            print(f"[ERROR] 重启 {SERVICE_NAME} 失败: {err2 or out2}", file=sys.stderr)
+            return False
+    finally:
+        if lock_fd:
+            try:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
+                lock_fd.close()
+            except Exception:
+                pass
 
     print(f"\n[OK] 转发规则已通过 {SERVICE_NAME} 生效并持久化！")
     print("[重要提醒]")
@@ -1978,22 +2001,6 @@ __PYTHON_PAYLOAD__
 main() {
     check_prereqs
     extract_payload
-
-    # Acquire file lock only for mutating or monitoring operations (if flock exists & writable /run)
-    local need_lock=1
-    for arg in "$@"; do
-        if [[ "$arg" == "--check" || "$arg" == "--help" || "$arg" == "-h" ]]; then
-            need_lock=0
-        fi
-    done
-
-    if [[ "$need_lock" == "1" && -w "/run" ]] && command -v flock >/dev/null 2>&1; then
-        exec 9>"$LOCK_FILE"
-        if ! flock -n 9; then
-            msg_err "已有另一个 ${APP_NAME} 实例正在运行（锁文件: ${LOCK_FILE}）。"
-            exit 1
-        fi
-    fi
 
     python3 "${TMP_DIR}/tool.py" "$@"
 }
