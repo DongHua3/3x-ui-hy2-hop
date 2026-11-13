@@ -44,7 +44,7 @@ check_prereqs() {
     local missing_mods
     missing_mods="$(python3 - <<'PY' 2>&1 || true
 missing = []
-for m in ("sqlite3", "http.server", "ctypes", "socket", "json", "secrets", "ipaddress", "threading"):
+for m in ("sqlite3", "ctypes", "socket", "json", "ipaddress", "threading"):
     try:
         __import__(m)
     except Exception as e:
@@ -72,12 +72,10 @@ extract_payload() {
 import argparse
 import ctypes
 import fcntl
-import http.server
 import ipaddress
 import json
 import os
 import re
-import secrets
 import shutil
 import signal
 import socket
@@ -88,7 +86,6 @@ import sys
 import tempfile
 import threading
 import time
-import urllib.parse
 from collections import deque
 
 CHAIN_NAME = "HY2_PORT_HOP"
@@ -894,17 +891,11 @@ def print_audit_report(report):
             print(f"  - {f}")
 
     for idx, ib in enumerate(report["hy2_inbounds"], 1):
-        sn = ib["client_snippets"]
         print(f"\n--- 客户端适配指引 (对应入站 #{idx} 端口 {ib['port']}) ---")
         print("  * PC 端 (v2rayN): 默认 Hysteria2 走 sing-box 内核；由于 3x-ui 通用链接不带跳跃间隔，")
-        print(f"    更新订阅后需在节点中手动补填间隔（如 {ib['hop_interval'] or '15-20'}）并复制到独立分组保存；若切 Xray 内核请升级含 PR #10550 版本。")
-        print("  * 手机端 (v2rayNG): 2.3.8–2.3.15 存在 Issue #6224 导致填了间隔仍锁死主端口，建议升级 >= 2.4.0；")
-        print("    若使用 NekoBox / sing-box (SFA)，端口范围必须用冒号分隔且间隔带单位 's'。")
-        print("\n  \033[31m[警告] 下方 FinalMask JSON 仅限填入【客户端 Outbound】，严禁填入 3x-ui 服务端 Inbound（否则报 udphop: client only）！\033[0m")
-        print("  [Xray >= 26.9.9 / v2rayNG 客户端完整 FinalMask JSON（已保留原有混淆与参数，udphop 置末位）]:")
-        print(json.dumps(sn["xray_finalmask_client_only"], ensure_ascii=False, indent=2))
-        print("\n  [sing-box / SFA 客户端 Outbound 参考片段]:")
-        print(json.dumps(sn["singbox_outbound"], ensure_ascii=False, indent=2))
+        print(f"    更新订阅后需在节点中手动补填间隔（如 {ib['hop_interval'] or '20-30'} 或单值 25）并复制到独立分组保存。")
+        print("  * 手机端 (v2rayNG / SFA / NekoBox): v2rayNG 2.3.8–2.3.15 存在跳跃不生效问题，建议升级 >= 2.4.0，")
+        print("    或改用 SFA / NekoBox（端口范围用冒号 47000:50000，间隔带单位如 25s）。")
     print("=" * 72 + "\n")
 
 
@@ -1588,233 +1579,13 @@ class HopMonitor:
             }
 
 
-# ------------------------------------------------------------------------------
-# Temporary Web Dashboard (127.0.0.1 default; Bearer token session)
-# ------------------------------------------------------------------------------
-
-WEB_HTML = r"""<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hy2 端口跳跃实时验证</title>
-<style>
-  body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; padding: 16px; }
-  .wrap { max-width: 1000px; margin: 0 auto; }
-  .card { background: #1e293b; border: 1px solid #334155; border-radius: 10px; padding: 16px; margin-bottom: 14px; }
-  h2 { margin: 0 0 10px; font-size: 18px; color: #38bdf8; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 10px; }
-  .metric { background: #0f172a; padding: 10px; border-radius: 8px; }
-  .metric .k { font-size: 12px; color: #94a3b8; }
-  .metric .v { font-size: 20px; font-weight: 700; margin-top: 4px; }
-  table { width: 100%; border-collapse: collapse; font-size: 13px; }
-  th, td { border-bottom: 1px solid #334155; padding: 8px; text-align: left; word-break: break-all; }
-  th { color: #94a3b8; }
-  .ok { color: #4ade80; font-weight: 600; }
-  .warn { color: #fbbf24; font-weight: 600; }
-  .err { color: #f87171; font-weight: 600; }
-  input, button { padding: 8px 12px; border-radius: 6px; border: 1px solid #475569; background: #0f172a; color: #f8fafc; }
-  button { background: #0284c7; border-color: #0284c7; cursor: pointer; font-weight: 600; }
-  .mono { font-family: ui-monospace, SFMono-Regular, monospace; font-size: 12px; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div id="authBox" class="card">
-    <h2>Hy2 端口跳跃实时监测看板</h2>
-    <p style="font-size:13px;color:#94a3b8;">请输入终端展示的一次性访问口令以兑换会话密钥（不走 URL 参数或 Cookie）：</p>
-    <input id="otpInput" type="password" placeholder="输入一次性口令" />
-    <button onclick="doAuth()">验证进入</button>
-    <span id="authMsg" class="err" style="margin-left:10px;"></span>
-  </div>
-
-  <div id="dash" style="display:none;">
-    <div class="card">
-      <h2>全局转发状态 <span id="meta" style="font-size:12px;color:#94a3b8;font-weight:400;"></span></h2>
-      <div class="grid">
-        <div class="metric"><div class="k">IPv4 NAT PREROUTING</div><div class="v" id="v4nat">-</div></div>
-        <div class="metric"><div class="k">IPv6 NAT PREROUTING</div><div class="v" id="v6nat">-</div></div>
-        <div class="metric"><div class="k">内核捕获 / 丢包</div><div class="v" id="kstats">-</div></div>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>客户端实时判定（按来源 IP 与协议族聚合）</h2>
-      <table>
-        <thead>
-          <tr><th>来源 IP</th><th>协议</th><th>主端口包 (入/出)</th><th>跳跃包 (入/出)</th><th>双向确认端口</th><th>源端口数</th><th>状态判定</th></tr>
-        </thead>
-        <tbody id="clientRows"></tbody>
-      </table>
-    </div>
-
-    <div class="card">
-      <h2>最近端口跳跃事件</h2>
-      <div id="events" class="mono" style="max-height:220px;overflow:auto;"></div>
-    </div>
-  </div>
-</div>
-<script>
-let sessionToken = "";
-async function doAuth() {
-  const otp = document.getElementById("otpInput").value.trim();
-  const r = await fetch("/api/auth", {
-    method: "POST",
-    headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({otp})
-  });
-  const j = await r.json();
-  if (!r.ok) {
-    document.getElementById("authMsg").textContent = j.error || "验证失败";
-    return;
-  }
-  sessionToken = j.token;
-  document.getElementById("authBox").style.display = "none";
-  document.getElementById("dash").style.display = "block";
-  poll();
-  setInterval(poll, 1200);
-}
-function statusCls(s) {
-  if (s.startsWith("已生效：")) return "ok";
-  if (s.startsWith("已生效(警告)") || s.startsWith("跳跃中：")) return "warn";
-  return "err";
-}
-async function poll() {
-  if (!sessionToken) return;
-  try {
-    const r = await fetch("/api/stats", {headers: {"Authorization": "Bearer " + sessionToken}});
-    if (!r.ok) return;
-    const d = await r.json();
-    document.getElementById("meta").textContent = `主端口 ${d.main_port} | 跳跃段 ${d.hop_ranges} | 已运行 ${d.uptime_sec}s`;
-    document.getElementById("v4nat").textContent = `${d.nat_counters.v4_pkts} pkts / ${d.nat_counters.v4_bytes} B`;
-    document.getElementById("v6nat").textContent = `${d.nat_counters.v6_pkts} pkts / ${d.nat_counters.v6_bytes} B`;
-    document.getElementById("kstats").textContent = `${d.kernel_packets} / ${d.kernel_drops}`;
-    const tb = document.getElementById("clientRows");
-    tb.innerHTML = d.clients.map(c => `<tr>
-      <td class="mono">${c.ip}</td>
-      <td>${c.family}</td>
-      <td>${c.main_in_pkts} / ${c.main_out_pkts}</td>
-      <td>${c.hop_in_pkts} / ${c.hop_out_pkts}</td>
-      <td class="mono">${c.hop_ports_bidir.slice(-6).join(", ") || "-"}</td>
-      <td>${c.client_sports_count}</td>
-      <td class="${statusCls(c.status)}">${c.status}</td>
-    </tr>`).join("") || `<tr><td colspan="7" style="color:#94a3b8;">等待客户端发包... 请在 PC 或手机连上节点并访问海外网站</td></tr>`;
-    document.getElementById("events").innerHTML = d.events.map(e =>
-      `<div>[${e.ts}] [${e.dir}] ${e.ip} (${e.fam}) ${e.detail}</div>`
-    ).join("");
-  } catch (e) {}
-}
-</script>
-</body>
-</html>
-"""
-
-
-class BoundedThreadingHTTPServer(http.server.ThreadingHTTPServer):
-    allow_reuse_address = True
-    daemon_threads = True
-
-
-def start_web_server(monitor, host, port):
-    otp = secrets.token_urlsafe(12)
-    session_tokens = set()
-    fail_state = {"count": 0, "locked_until": 0.0}
-    lock = threading.Lock()
-
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def setup(self):
-            super().setup()
-            self.request.settimeout(5.0)
-
-        def log_message(self, format, *args):
-            return
-
-        def _send_json(self, code, obj):
-            body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("Connection", "close")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-
-        def do_GET(self):
-            path = urllib.parse.urlparse(self.path).path
-            if path == "/":
-                body = WEB_HTML.encode("utf-8")
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Cache-Control", "no-store")
-                self.send_header("Connection", "close")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-            elif path == "/api/stats":
-                auth = self.headers.get("Authorization", "")
-                tok = auth[7:].strip() if auth.startswith("Bearer ") else ""
-                with lock:
-                    ok = tok in session_tokens
-                if not ok:
-                    self._send_json(401, {"error": "Unauthorized"})
-                    return
-                self._send_json(200, monitor.snapshot())
-            else:
-                self._send_json(404, {"error": "Not found"})
-
-        def do_POST(self):
-            path = urllib.parse.urlparse(self.path).path
-            if path != "/api/auth":
-                self._send_json(404, {"error": "Not found"})
-                return
-            now = time.time()
-            with lock:
-                if now < fail_state["locked_until"]:
-                    self._send_json(429, {"error": "尝试次数过多，请稍后再试"})
-                    return
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), 4096)
-                raw = self.rfile.read(length)
-                data = json.loads(raw.decode("utf-8"))
-                user_otp = str(data.get("otp", "")).strip()
-            except Exception:
-                self._send_json(400, {"error": "Bad request"})
-                return
-            if secrets.compare_digest(user_otp, otp):
-                tok = secrets.token_urlsafe(24)
-                with lock:
-                    session_tokens.add(tok)
-                    fail_state["count"] = 0
-                self._send_json(200, {"token": tok})
-            else:
-                with lock:
-                    fail_state["count"] += 1
-                    if fail_state["count"] >= 5:
-                        fail_state["locked_until"] = now + 30.0
-                self._send_json(403, {"error": "口令错误"})
-
-    srv = BoundedThreadingHTTPServer((host, port), Handler)
-    t = threading.Thread(target=srv.serve_forever, daemon=True)
-    t.start()
-    return srv, otp
-
-
-def run_monitor_loop(report, main_port, hop_ports_str, enable_web=False, public_web=False, web_port=18080):
+def run_monitor_loop(report, main_port, hop_ports_str):
     if not is_root():
         print("[ERROR] 实时 AF_PACKET 抓包检测需要 root 权限！", file=sys.stderr)
         return
     ranges = parse_port_spec(hop_ports_str)
     mon = HopMonitor(main_port, ranges, report["network"])
     mon.start()
-
-    srv = None
-    otp = ""
-    if enable_web:
-        bind_host = "0.0.0.0" if public_web else "127.0.0.1"
-        try:
-            srv, otp = start_web_server(mon, bind_host, web_port)
-        except Exception as e:
-            print(f"[WARN] 启动临时监控网页失败: {e}")
 
     stop_flag = threading.Event()
 
@@ -1839,16 +1610,9 @@ def run_monitor_loop(report, main_port, hop_ports_str, enable_web=False, public_
             if snap["error"]:
                 print(f"\033[31m[错误] {snap['error']}\033[0m")
 
-            if srv:
-                print("\n--- 临时监控网页（退出即自动关闭）---")
-                print(f"  一次性口令 : \033[33m{otp}\033[0m")
-                print(f"  SSH 隧道访问(推荐): ssh -N -L {web_port}:127.0.0.1:{web_port} root@{ext_ip}  然后打开 http://127.0.0.1:{web_port}/")
-                if public_web:
-                    print(f"  \033[31m[公网明文模式已开启]\033[0m 直连地址: http://{ext_ip}:{web_port}/ （注意 HTTP 明文风险与云安全组需放行 {web_port}/tcp）")
-
             print("\n--- 客户端实时判定（首包即跳：正常时主端口命中应为 0）---")
             if not snap["clients"]:
-                print("  等待客户端数据包... 请在 PC / 手机连上该节点并访问海外网站（连续使用 20s 观察端口轮换）")
+                print("  等待客户端数据包... 请在 PC / 手机连上该节点并访问海外网站（连续使用 20-30s 观察端口轮换）")
             else:
                 print(f"  {'来源 IP':<26} {'族':<5} {'主端口(入/出)':<15} {'跳跃(入/出)':<15} {'源端口数':<8} {'已确认跳转端口'}")
                 for c in snap["clients"][:10]:
@@ -1864,14 +1628,11 @@ def run_monitor_loop(report, main_port, hop_ports_str, enable_web=False, public_
 
             print(f"\n[定界提示] 若跳跃包持续为 0，可在本地执行以下探针区分“云安全组拦截”与“客户端未跳”:")
             print(f"  python3 -c \"import socket;s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.sendto(b'hy2probe',('{ext_ip}',{probe_port}))\"")
-            print("按 Ctrl+C 停止监测并自动关闭临时端口。")
+            print("按 Ctrl+C 停止监测并返回。")
             sys.stdout.flush()
             stop_flag.wait(1.0)
     finally:
         mon.stop()
-        if srv:
-            srv.shutdown()
-            srv.server_close()
 
 
 # ------------------------------------------------------------------------------
@@ -1918,11 +1679,10 @@ def interactive_menu(args):
     while True:
         report = run_audit()
         print("\n================ 3x-ui Hy2 端口跳跃助手 ================")
-        print("  1) 全面体检（3x-ui / 双栈监听 / 防火墙 / PC与手机端指引）")
+        print("  1) 全面体检（3x-ui / 双栈监听 / 防火墙 / 客户端适配提示）")
         print("  2) 一键配置并持久化端口转发（IPv4 + IPv6 systemd）")
         print("  3) 实时检测端口跳跃是否生效（CLI 双向监测）")
-        print("  4) 实时检测 + 启动临时 Web 监控看板（默认 127.0.0.1 安全隧道）")
-        print("  5) 卸载并清理端口转发规则与持久化服务")
+        print("  4) 卸载并清理端口转发规则与持久化服务")
         print("  0) 退出")
         choice = tty_input("请选择操作 [1]: ", "0")
 
@@ -1941,18 +1701,8 @@ def interactive_menu(args):
             tty_input("按回车继续...", "")
         elif choice == "3":
             main_port, hop_str = choose_hy2_params(report)
-            run_monitor_loop(report, main_port, hop_str, enable_web=False)
+            run_monitor_loop(report, main_port, hop_str)
         elif choice == "4":
-            main_port, hop_str = choose_hy2_params(report)
-            wp = tty_input(f"临时网页端口 [{args.port}]: ", str(args.port))
-            pub = tty_input("是否公网监听 0.0.0.0（默认仅 127.0.0.1 走 ssh -L）？(y/N) [N]: ", "N")
-            run_monitor_loop(
-                report, main_port, hop_str,
-                enable_web=True,
-                public_web=(pub.lower() == "y" or args.public_web),
-                web_port=int(wp),
-            )
-        elif choice == "5":
             ans = tty_input(f"确认卸载 {SERVICE_NAME} 并清除 {CHAIN_NAME} 规则？(y/N) [N]: ", "N")
             if ans.lower() == "y":
                 uninstall_nat(dry_run=args.dry_run)
@@ -1969,9 +1719,6 @@ def main():
     parser.add_argument("--dry-run", action="store_true", help="仅预览变更不写入系统")
     parser.add_argument("--uninstall", action="store_true", help="清理 NAT 规则与持久化服务")
     parser.add_argument("--monitor", action="store_true", help="启动 CLI 实时双向抓包检测")
-    parser.add_argument("--web", action="store_true", help="与 --monitor 联用，开启临时 Web 看板")
-    parser.add_argument("--public-web", action="store_true", help="允许临时 Web 看板绑定 0.0.0.0（默认 127.0.0.1）")
-    parser.add_argument("--port", type=int, default=18080, help="临时 Web 看板端口（默认 18080）")
     parser.add_argument("--main-port", type=int, default=0, help="手动指定 Hysteria2 主端口")
     parser.add_argument("--hop-ports", type=str, default="", help="手动指定跳跃端口范围，如 47000-50000")
     parser.add_argument("--force-v6", action="store_true", help="强制同时写入 IPv6 转发规则")
@@ -2001,7 +1748,7 @@ def main():
         ib = report["hy2_inbounds"][0] if report["hy2_inbounds"] else None
         mp = args.main_port or (ib["port"] if ib else 443)
         hp = args.hop_ports or (ib["hop_ports"] if ib and ib["hop_ports"] else "47000-50000")
-        run_monitor_loop(report, mp, hp, enable_web=args.web, public_web=args.public_web, web_port=args.port)
+        run_monitor_loop(report, mp, hp)
         sys.exit(0)
 
     # Interactive mode
